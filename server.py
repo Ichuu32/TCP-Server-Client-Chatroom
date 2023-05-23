@@ -1,35 +1,74 @@
-# Create API of ML model using flask
 
-'''
-This code takes the JSON data while POST request an performs the prediction using loaded model and returns
-the results in JSON format.
-'''
+# Standard library imports
+import logging
+import socket
+import time
 
-# Import libraries
-import numpy as np
-from flask import Flask, request, jsonify
-import pickle
+# Local imports
+from spyder.plugins.completion.providers.languageserver.transport.tcp.consumer import (
+    TCPIncomingMessageThread)
+from spyder.plugins.completion.providers.languageserver.transport.common.producer import (
+    LanguageServerClient)
+from spyder.py3compat import ConnectionError, BrokenPipeError
 
-app = Flask(__name__)
 
-# Load the model
-model = pickle.load(open('model.pkl','rb'))
+logger = logging.getLogger(__name__)
 
-@app.route('/api/',methods=['POST'])
-def predict():
-    # Get the data from the POST request.
-    data = request.get_json(force=True)
 
-    # Make prediction using model loaded from disk as per the data.
-    prediction = model.predict([[np.array(data['exp'])]])
+class TCPLanguageServerClient(LanguageServerClient):
+    """Implementation of a v3.0 compilant language server TCP client."""
+    MAX_TIMEOUT_TIME = 20000
 
-    # Take the first value of prediction
-    output = prediction[0]
+    def __init__(self, host='127.0.0.1', port=2087, zmq_in_port=7000,
+                 zmq_out_port=7001):
+        LanguageServerClient.__init__(self, zmq_in_port, zmq_out_port)
+        self.req_status = {}
+        self.host = host
+        self.port = port
+        self.socket = None
+        # self.request_seq = 1
+        logger.info('Connecting to language server at {0}:{1}'.format(
+            self.host, self.port))
+        super(TCPLanguageServerClient, self).finalize_initialization()
+        self.socket.setblocking(True)
+        self.reading_thread = TCPIncomingMessageThread()
+        self.reading_thread.initialize(self.socket, self.zmq_out_socket,
+                                       self.req_status)
 
-    return jsonify(output)
+    def start(self):
+        self.reading_thread.start()
+        logger.info('Ready to receive/attend requests and responses!')
 
-if __name__ == '__main__':
-    try:
-        app.run(port=5000, debug=True)
-    except:
-        print("Server is exited unexpectedly. Please contact server admin.")
+    def stop(self):
+        logger.info('Closing TCP socket...')
+        self.socket.close()
+        logger.info('Closing consumer thread...')
+        self.reading_thread.stop()
+        logger.debug('Exit routine should be complete')
+
+    def transport_send(self, content_length, body):
+        logger.debug('Sending message via TCP')
+        try:
+            self.socket.send(content_length)
+            self.socket.send(body)
+        except (BrokenPipeError, ConnectionError) as e:
+            # This avoids a total freeze at startup
+            # when we're trying to connect to a TCP
+            # socket that rejects our connection
+            logger.error(e)
+
+    def is_server_alive(self):
+        connected = False
+        initial_time = time.time()
+        connection_error = None
+        while not connected:
+            try:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.connect((self.host, int(self.port)))
+                connected = True
+            except Exception as e:
+                connection_error = e
+
+            if time.time() - initial_time > self.MAX_TIMEOUT_TIME:
+                break
+        return connected, connection_error, None
